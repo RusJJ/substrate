@@ -38,6 +38,16 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef CHECK_FOR_HOOK_REPEATING
+#define HOOKSC  4096
+struct hookedAddrs
+{
+    int count = 0;
+    uintptr_t addrOfHooked[HOOKSC] = {0};
+    uintptr_t replacedWith[HOOKSC] = {0};
+} hooks;
+#endif // CHECK_FOR_HOOK_REPEATING
+
 #ifdef __arm__
 /* WebCore (ARM) PC-Relative:
 X    1  ldr r*,[pc,r*] !=
@@ -90,7 +100,8 @@ X 4790  ldr r*,[pc,#*]    */
 #define T1$ldr_rt_$rn_im$(rt, rn, im) /* ldr rt, [rn, #im] */ \
     (0xf850 | ((im < 0 ? 0 : 1) << 7) | (rn))
 #define T2$ldr_rt_$rn_im$(rt, rn, im) /* ldr rt, [rn, #im] */ \
-    (((rt) << 12) | abs(im))
+    (((rt) << 12) | labs(im))
+    // RusJJ: that was abs
 
 #define T1$mrs_rd_apsr(rd) /* mrs rd, apsr */ \
     (0xf3ef)
@@ -156,9 +167,9 @@ extern "C" size_t MSGetInstructionWidth(void *start) {
         return MSGetInstructionWidthThumb(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(start) & ~0x1));
 }
 
-static void SubstrateHookFunctionThumb(SubstrateProcessRef process, void *symbol, void *replace, void **result) {
+static bool SubstrateHookFunctionThumb(SubstrateProcessRef process, void *symbol, void *replace, void **result, bool wasHookedBefore = false) {
     if (symbol == NULL)
-        return;
+        return false;
 
     uint16_t *area(reinterpret_cast<uint16_t *>(symbol));
 
@@ -181,10 +192,11 @@ static void SubstrateHookFunctionThumb(SubstrateProcessRef process, void *symbol
 
         arm[1] = reinterpret_cast<uint32_t>(replace);
 
-        return;
+        return true;
     }
 
     size_t required((trail - area) * sizeof(uint16_t));
+    if(wasHookedBefore && required < 8) required = 8; //
 
     size_t used(0);
     while (used < required)
@@ -236,13 +248,13 @@ static void SubstrateHookFunctionThumb(SubstrateProcessRef process, void *symbol
     if (buffer == MAP_FAILED) {
         MSLog(MSLogLevelError, "MS:Error:mmap() = %d", errno);
         *result = NULL;
-        return;
+        return false;
     }
 
     if (false) fail: {
         munmap(buffer, length);
         *result = NULL;
-        return;
+        return false;
     }
 
     size_t start(pad), end(length / sizeof(uint16_t));
@@ -462,6 +474,10 @@ static void SubstrateHookFunctionThumb(SubstrateProcessRef process, void *symbol
             buffer[start+0] = T1$ldr_rt_$rn_im$(exts.rt, A$pc, T$Label(start+0, end-2));
             buffer[start+1] = T2$ldr_rt_$rn_im$(exts.rt, A$pc, T$Label(start+0, end-2));
 
+            // Org:
+            //buffer[start+0] = T1$ldr_rt_$rn_im$(exts.rt, A$pc, (int)T$Label(start+0, end-2));
+            //buffer[start+1] = T2$ldr_rt_$rn_im$(exts.rt, A$pc, (int)T$Label(start+0, end-2));
+
             buffer[start+2] = T1$ldr_rt_$rn_im$(exts.rt, exts.rt, 0);
             buffer[start+3] = T2$ldr_rt_$rn_im$(exts.rt, exts.rt, 0);
 
@@ -515,9 +531,9 @@ static void SubstrateHookFunctionThumb(SubstrateProcessRef process, void *symbol
     transfer[0] = A$ldr_rd_$rn_im$(A$pc, A$pc, 4 - 8);
     transfer[1] = reinterpret_cast<uint32_t>(area + used / sizeof(uint16_t)) + 1;
 
-    if (mprotect(buffer, length, PROT_READ | PROT_EXEC) == -1) {
+    if (mprotect(buffer, length, PROT_WRITE | PROT_READ | PROT_EXEC) == -1) {
         MSLog(MSLogLevelError, "MS:Error:mprotect():%d", errno);
-        return;
+        return false;
     }
 
     *result = reinterpret_cast<uint8_t *>(buffer + pad) + 1;
@@ -551,11 +567,12 @@ static void SubstrateHookFunctionThumb(SubstrateProcessRef process, void *symbol
         sprintf(name, "%p", area);
         MSLogHexEx(area, used + sizeof(uint16_t), 2, name);
     }
+    return true;
 }
 
-static void SubstrateHookFunctionARM(SubstrateProcessRef process, void *symbol, void *replace, void **result) {
+static bool SubstrateHookFunctionARM(SubstrateProcessRef process, void *symbol, void *replace, void **result, bool wasHookedBefore = false) {
     if (symbol == NULL)
-        return;
+        return false;
 
     uint32_t *area(reinterpret_cast<uint32_t *>(symbol));
     uint32_t *arm(area);
@@ -572,103 +589,106 @@ static void SubstrateHookFunctionARM(SubstrateProcessRef process, void *symbol, 
 
     if (result != NULL) {
 
-    if (backup[0] == A$ldr_rd_$rn_im$(A$pc, A$pc, 4 - 8)) {
-        *result = reinterpret_cast<void *>(backup[1]);
-        return;
-    }
-
-    size_t length(used);
-    for (unsigned offset(0); offset != used / sizeof(uint32_t); ++offset)
-        if (A$pcrel$r(backup[offset])) {
-            if ((backup[offset] & 0x02000000) == 0 || (backup[offset] & 0x0000f000 >> 12) != (backup[offset] & 0x0000000f))
-                length += 2 * sizeof(uint32_t);
-            else
-                length += 4 * sizeof(uint32_t);
+        if (backup[0] == A$ldr_rd_$rn_im$(A$pc, A$pc, 4 - 8)) {
+            *result = reinterpret_cast<void *>(backup[1]);
+            // XMDS fix
+            SubstrateHookMemory code(process, symbol, used);
+            arm[1] = reinterpret_cast<uint32_t>(replace);
+            return true;
         }
 
-    length += 2 * sizeof(uint32_t);
-
-    uint32_t *buffer(reinterpret_cast<uint32_t *>(mmap(
-        NULL, length, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0
-    )));
-
-    if (buffer == MAP_FAILED) {
-        MSLog(MSLogLevelError, "MS:Error:mmap() = %d", errno);
-        *result = NULL;
-        return;
-    }
-
-    if (false) fail: {
-        munmap(buffer, length);
-        *result = NULL;
-        return;
-    }
-
-    size_t start(0), end(length / sizeof(uint32_t));
-    uint32_t *trailer(reinterpret_cast<uint32_t *>(buffer + end));
-    for (unsigned offset(0); offset != used / sizeof(uint32_t); ++offset)
-        if (A$pcrel$r(backup[offset])) {
-            union {
-                uint32_t value;
-
-                struct {
-                    uint32_t rm : 4;
-                    uint32_t : 1;
-                    uint32_t shift : 2;
-                    uint32_t shiftamount : 5;
-                    uint32_t rd : 4;
-                    uint32_t rn : 4;
-                    uint32_t l : 1;
-                    uint32_t w : 1;
-                    uint32_t b : 1;
-                    uint32_t u : 1;
-                    uint32_t p : 1;
-                    uint32_t mode : 1;
-                    uint32_t type : 2;
-                    uint32_t cond : 4;
-                };
-            } bits = {backup[offset+0]}, copy(bits);
-
-            bool guard;
-            if (bits.mode == 0 || bits.rd != bits.rm) {
-                copy.rn = bits.rd;
-                guard = false;
-            } else {
-                copy.rn = bits.rm != A$r0 ? A$r0 : A$r1;
-                guard = true;
+        size_t length(used);
+        for (unsigned offset(0); offset != used / sizeof(uint32_t); ++offset)
+            if (A$pcrel$r(backup[offset])) {
+                if ((backup[offset] & 0x02000000) == 0 || (backup[offset] & 0x0000f000 >> 12) != (backup[offset] & 0x0000000f))
+                    length += 2 * sizeof(uint32_t);
+                else
+                    length += 4 * sizeof(uint32_t);
             }
 
-            if (guard)
-                buffer[start++] = A$stmdb_sp$_$rs$((1 << copy.rn));
+        length += 2 * sizeof(uint32_t);
 
-            buffer[start+0] = A$ldr_rd_$rn_im$(copy.rn, A$pc, (end-1 - (start+0)) * 4 - 8);
-            buffer[start+1] = copy.value;
+        uint32_t *buffer(reinterpret_cast<uint32_t *>(mmap(
+            NULL, length, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0
+        )));
 
-            start += 2;
+        if (buffer == MAP_FAILED) {
+            MSLog(MSLogLevelError, "MS:Error:mmap() = %d", errno);
+            *result = NULL;
+            return false;
+        }
 
-            if (guard)
-                buffer[start++] = A$ldmia_sp$_$rs$((1 << copy.rn));
+        if (false) fail: {
+            munmap(buffer, length);
+            *result = NULL;
+            return false;
+        }
 
-            *--trailer = reinterpret_cast<uint32_t>(area + offset) + 8;
-            end -= 1;
-        } else
-            buffer[start++] = backup[offset];
+        size_t start(0), end(length / sizeof(uint32_t));
+        uint32_t *trailer(reinterpret_cast<uint32_t *>(buffer + end));
+        for (unsigned offset(0); offset != used / sizeof(uint32_t); ++offset)
+            if (A$pcrel$r(backup[offset])) {
+                union {
+                    uint32_t value;
 
-    buffer[start+0] = A$ldr_rd_$rn_im$(A$pc, A$pc, 4 - 8);
-    buffer[start+1] = reinterpret_cast<uint32_t>(area + used / sizeof(uint32_t));
+                    struct {
+                        uint32_t rm : 4;
+                        uint32_t : 1;
+                        uint32_t shift : 2;
+                        uint32_t shiftamount : 5;
+                        uint32_t rd : 4;
+                        uint32_t rn : 4;
+                        uint32_t l : 1;
+                        uint32_t w : 1;
+                        uint32_t b : 1;
+                        uint32_t u : 1;
+                        uint32_t p : 1;
+                        uint32_t mode : 1;
+                        uint32_t type : 2;
+                        uint32_t cond : 4;
+                    };
+                } bits = {backup[offset+0]}, copy(bits);
 
-    if (mprotect(buffer, length, PROT_READ | PROT_EXEC) == -1) {
-        MSLog(MSLogLevelError, "MS:Error:mprotect():%d", errno);
-        goto fail;
-    }
+                bool guard;
+                if (bits.mode == 0 || bits.rd != bits.rm) {
+                    copy.rn = bits.rd;
+                    guard = false;
+                } else {
+                    copy.rn = bits.rm != A$r0 ? A$r0 : A$r1;
+                    guard = true;
+                }
 
-    *result = buffer;
+                if (guard)
+                    buffer[start++] = A$stmdb_sp$_$rs$((1 << copy.rn));
 
-    if (MSDebug) {
-        char name[16];
-        sprintf(name, "%p", *result);
-        MSLogHexEx(buffer, length, 4, name);
-    }
+                buffer[start+0] = A$ldr_rd_$rn_im$(copy.rn, A$pc, (int)((end-1 - (start+0)) * 4 - 8));
+                buffer[start+1] = copy.value;
+
+                start += 2;
+
+                if (guard)
+                    buffer[start++] = A$ldmia_sp$_$rs$((1 << copy.rn));
+
+                *--trailer = reinterpret_cast<uint32_t>(area + offset) + 8;
+                end -= 1;
+            } else
+                buffer[start++] = backup[offset];
+
+        buffer[start+0] = A$ldr_rd_$rn_im$(A$pc, A$pc, 4 - 8);
+        buffer[start+1] = reinterpret_cast<uint32_t>(area + used / sizeof(uint32_t));
+
+        if (mprotect(buffer, length, PROT_WRITE | PROT_READ | PROT_EXEC) == -1) {
+            MSLog(MSLogLevelError, "MS:Error:mprotect():%d", errno);
+            goto fail;
+        }
+
+        *result = buffer;
+
+        if (MSDebug) {
+            char name[16];
+            sprintf(name, "%p", *result);
+            MSLogHexEx(buffer, length, 4, name);
+        }
 
     }
 
@@ -684,15 +704,61 @@ static void SubstrateHookFunctionARM(SubstrateProcessRef process, void *symbol, 
         sprintf(name, "%p", area);
         MSLogHexEx(area, used + sizeof(uint32_t), 4, name);
     }
+    return true;
 }
 
-static void SubstrateHookFunction(SubstrateProcessRef process, void *symbol, void *replace, void **result) {
+static bool SubstrateHookFunction(SubstrateProcessRef process, void *symbol, void *replace, void **result) {
     if (MSDebug)
         MSLog(MSLogLevelNotice, "SubstrateHookFunction(%p, %p, %p, %p)", process, symbol, replace, result);
-    if ((reinterpret_cast<uintptr_t>(symbol) & 0x1) == 0)
-        return SubstrateHookFunctionARM(process, symbol, replace, result);
+
+    void* pSymbol = symbol;
+    bool wasHookedBefore = false; //
+    #ifdef CHECK_FOR_HOOK_REPEATING
+    for(int i = 0; i < hooks.count; ++i)
+    {
+        if(pSymbol == (void*)hooks.addrOfHooked[i])
+        {
+            wasHookedBefore = true;
+            break;
+        }
+        /*if(pSymbol == (void*)hooks.addrOfHooked[i])
+        {
+            MSLog(MSLogLevelError, "SubstrateHookFunction returned to hook!");
+            return false;
+            pSymbol = (void*)hooks.replacedWith[i];
+            MSLog(MSLogLevelError, "SubstrateHookFunction has replaced the var with the hooked one!");
+            break;
+        }*/
+    }
+    #endif // CHECK_FOR_HOOK_REPEATING
+
+    if ((reinterpret_cast<uintptr_t>(pSymbol) & 0x1) == 0)
+    {
+        if(SubstrateHookFunctionARM(process, pSymbol, replace, result, wasHookedBefore)) //
+        {
+            #ifdef CHECK_FOR_HOOK_REPEATING
+            if(wasHookedBefore) return true; //
+            hooks.addrOfHooked[hooks.count] = (uintptr_t)pSymbol;
+            hooks.replacedWith[hooks.count] = (uintptr_t)replace;
+            ++hooks.count;
+            #endif // CHECK_FOR_HOOK_REPEATING
+            return true;
+        }
+    }
     else
-        return SubstrateHookFunctionThumb(process, reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(symbol) & ~0x1), replace, result);
+    {
+        if(SubstrateHookFunctionThumb(process, reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(pSymbol) & ~0x1), replace, result, wasHookedBefore)) //
+        {
+            #ifdef CHECK_FOR_HOOK_REPEATING
+            if(wasHookedBefore) return true; //
+            hooks.addrOfHooked[hooks.count] = (uintptr_t)pSymbol;
+            hooks.replacedWith[hooks.count] = (uintptr_t)replace;
+            ++hooks.count;
+            #endif // CHECK_FOR_HOOK_REPEATING
+            return true;
+        }
+    }
+    return false;
 }
 #endif
 
@@ -935,7 +1001,7 @@ static void SubstrateHookFunction(SubstrateProcessRef process, void *symbol, voi
         MSWriteJump(current, area + used);
     }
 
-    if (mprotect(buffer, length, PROT_READ | PROT_EXEC) == -1) {
+    if (mprotect(buffer, length, PROT_WRITE | PROT_READ | PROT_EXEC) == -1) {
         MSLog(MSLogLevelError, "MS:Error:mprotect():%d", errno);
         goto fail;
     }
@@ -967,7 +1033,8 @@ static void SubstrateHookFunction(SubstrateProcessRef process, void *symbol, voi
 }
 #endif
 
-_extern void MSHookFunction(void *symbol, void *replace, void **result) {
+_extern bool MSHookFunction(void *symbol, void *replace, void **result)
+{
     return SubstrateHookFunction(NULL, symbol, replace, result);
 }
 

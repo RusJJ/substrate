@@ -49,15 +49,16 @@
 
 #else
 
+#include <android/log.h>
 #define MSLog(level, format, ...) do { \
-    syslog(level, format, ## __VA_ARGS__); \
+    __android_log_print(level, "Cydia Substrate", format, ## __VA_ARGS__); \
 } while (false)
 
 #endif
 
-#define MSLogLevelNotice LOG_NOTICE
-#define MSLogLevelWarning LOG_WARNING
-#define MSLogLevelError LOG_ERR
+#define MSLogLevelNotice ANDROID_LOG_INFO
+#define MSLogLevelWarning ANDROID_LOG_WARNING
+#define MSLogLevelError ANDROID_LOG_ERROR
 
 #endif
 

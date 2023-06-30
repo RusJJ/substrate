@@ -38,6 +38,11 @@ extern "C" {
 #include <dlfcn.h>
 #include <stdlib.h>
 
+/* ====================================== */
+#define CHECK_FOR_HOOK_REPEATING
+/* ====================================== */
+
+
 #define _finline \
     inline __attribute__((__always_inline__))
 #define _disused \
@@ -65,7 +70,7 @@ typedef const void *MSImageRef;
 MSImageRef MSGetImageByName(const char *file);
 void *MSFindSymbol(MSImageRef image, const char *name);
 
-void MSHookFunction(void *symbol, void *replace, void **result);
+bool MSHookFunction(void *symbol, void *replace, void **result);
 
 #ifdef __APPLE__
 #ifdef __arm__
@@ -274,7 +279,7 @@ static inline Type_ &MSHookIvar(id self, const char *name) {
 #endif/*__APPLE__*/
 
 template <typename Type_>
-static inline void MSHookFunction(Type_ *symbol, Type_ *replace, Type_ **result) {
+static inline bool MSHookFunction(Type_ *symbol, Type_ *replace, Type_ **result) {
     return MSHookFunction(
         reinterpret_cast<void *>(symbol),
         reinterpret_cast<void *>(replace),
@@ -283,7 +288,7 @@ static inline void MSHookFunction(Type_ *symbol, Type_ *replace, Type_ **result)
 }
 
 template <typename Type_>
-static inline void MSHookFunction(Type_ *symbol, Type_ *replace) {
+static inline bool MSHookFunction(Type_ *symbol, Type_ *replace) {
     return MSHookFunction(symbol, replace, reinterpret_cast<Type_ **>(NULL));
 }
 
@@ -293,7 +298,7 @@ static inline void MSHookSymbol(Type_ *&value, const char *name, MSImageRef imag
 }
 
 template <typename Type_>
-static inline void MSHookFunction(const char *name, Type_ *replace, Type_ **result = NULL) {
+static inline bool MSHookFunction(const char *name, Type_ *replace, Type_ **result = NULL) {
     Type_ *symbol;
     MSHookSymbol(symbol, name);
     return MSHookFunction(symbol, replace, result);

@@ -172,7 +172,7 @@ static void MSHookMessageInternal(Class _class, SEL sel, IMP imp, IMP *result, c
             MSWriteJump(current, I$rax);
 #endif
 
-            if (mprotect(buffer, length, PROT_READ | PROT_EXEC) == -1) {
+            if (mprotect(buffer, length, PROT_WRITE | PROT_READ | PROT_EXEC) == -1) {
                 MSLog(MSLogLevelError, "MS:Error:mprotect():%d", errno);
                 goto fail;
             }
